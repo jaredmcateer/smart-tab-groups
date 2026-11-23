@@ -7,31 +7,59 @@ const OPT_KEYS = [
 	'avoidDuplicates',
 ];
 const OPT_DEFAULTS = { automatic: true };
-const AUTO_CREATED_GROUP_IDS_KEY = 'autoCreatedGroupIds';
+/** Legacy storage.sync key that held auto-created group IDs. IDs change on browser restart, so it is no longer used. */
+const LEGACY_AUTO_IDS_KEY = 'autoCreatedGroupIds';
 
-const getStoredAutoCreatedGroupIds = () =>
-	new Promise((r) =>
-		chrome.storage.sync.get(AUTO_CREATED_GROUP_IDS_KEY, (o) =>
-			r(Array.isArray(o.autoCreatedGroupIds) ? o.autoCreatedGroupIds : []),
-		),
-	);
-const addToAutoCreatedGroupIds = (ids) =>
-	getStoredAutoCreatedGroupIds().then((arr) => {
-		const next = [...new Set([...arr, ...ids])];
-		return new Promise((r) => chrome.storage.sync.set({ [AUTO_CREATED_GROUP_IDS_KEY]: next }, r));
-	});
+/**
+ * Invisible suffix stamped on every group title we create. Titles survive a
+ * browser restart (group IDs do not), so this is how a generated group is told
+ * apart from a hand-made one. Renaming a group drops the mark, making it manual.
+ */
+const AUTO_MARK = '​';
+/** Groups created this session: covers the gap between tabs.group() and the title update. */
+const sessionAutoIds = new Set();
+const markAuto = (ids) => {
+	for (const id of ids) sessionAutoIds.add(id);
+};
+const hasAutoMark = (g) => g.title?.endsWith(AUTO_MARK) ?? false;
+const bareTitle = (key) => key?.split('.')[0] ?? key;
 
-/** Set of group IDs we should ignore: groups we did not create (manually created). */
-const getManualGroupIds = () =>
-	Promise.all([getStoredAutoCreatedGroupIds(), chrome.tabGroups.query({})]).then(
-		([storedAuto, allGroups]) => {
-			const currentIds = new Set(allGroups.map((g) => g.id));
-			const autoCreated = new Set(
-				storedAuto.map(Number).filter((id) => id > 0 && currentIds.has(id)),
-			);
-			return new Set([...currentIds].filter((id) => !autoCreated.has(id)));
-		},
-	);
+/** Legacy/restored group without the mark whose title equals the domain title of every tab in it. */
+const matchesDomainTitle = (g, groupTabs, groupBySubdomain) => {
+	if (!g.title || !groupTabs.length) return false;
+	const keys = new Set(groupTabs.map((t) => getKey(t.url, groupBySubdomain)));
+	if (keys.size !== 1) return false;
+	const [key] = keys;
+	return key != null && bareTitle(key) === g.title;
+};
+
+const stampAutoMark = (g) =>
+	chrome.tabGroups.update(g.id, { title: g.title + AUTO_MARK }).catch(() => {});
+
+/**
+ * Set of group IDs we should ignore: groups we did not create (manually created).
+ * With adoptByTitle, unmarked groups that match their tabs' domain title are
+ * adopted and stamped instead (used after browser restart and extension update).
+ */
+async function getManualGroupIds({ adoptByTitle = false } = {}) {
+	const [groups, tabs, opts] = await Promise.all([
+		chrome.tabGroups.query({}),
+		adoptByTitle ? chrome.tabs.query({}) : Promise.resolve([]),
+		getOpts(),
+	]);
+	const manual = new Set();
+	for (const g of groups) {
+		if (hasAutoMark(g) || sessionAutoIds.has(g.id)) continue;
+		const groupTabs = tabs.filter((t) => t.groupId === g.id);
+		if (adoptByTitle && matchesDomainTitle(g, groupTabs, opts.groupBySubdomain)) {
+			markAuto([g.id]);
+			await stampAutoMark(g);
+			continue;
+		}
+		manual.add(g.id);
+	}
+	return manual;
+}
 
 const RESTRICTED_HOSTS = /^(chrome\.google\.com|chromewebstore\.google\.com|addons\.mozilla\.org|addons\.allizom\.org)$/;
 const isRestrictedUrl = (url) => {
@@ -62,8 +90,8 @@ const keyFromHostname = (hostname, groupBySubdomain) => {
 };
 const getKey = (url, groupBySubdomain) =>
 	isRestrictedUrl(url) ? null : keyFromHostname(hostnameFromUrl(url), groupBySubdomain);
-/** Display title: domain → first label (e.g. google), subdomain → first label (e.g. foo). */
-const getTitle = (key) => key?.split('.')[0] ?? key;
+/** Display title: domain → first label (e.g. google), subdomain → first label (e.g. foo); carries AUTO_MARK. */
+const getTitle = (key) => `${bareTitle(key) ?? ''}${AUTO_MARK}`;
 
 const getOpts = () =>
 	new Promise((resolve) => {
@@ -98,6 +126,7 @@ async function createGroup({ windowId, key, tabIds, idx }) {
 		tabIds,
 		createProperties: { windowId },
 	});
+	markAuto([groupId]);
 	await chrome.tabGroups.update(groupId, { title: getTitle(key) });
 	return { groupId, title: key, key, idx };
 }
@@ -118,6 +147,14 @@ const collapseGroupWithMove = (groupId, index) =>
 		});
 
 const TAB_EDIT_BLOCKED = 'Tabs cannot be edited right now';
+const isEditBlocked = (err) => String(err?.message ?? err).includes(TAB_EDIT_BLOCKED);
+/** Retry fn while Chrome reports tabs are mid-edit (drag, session restore). */
+const retryIfEditBlocked = (fn, tries = 3) =>
+	fn().catch((err) =>
+		tries > 1 && isEditBlocked(err)
+			? delay(200).then(() => retryIfEditBlocked(fn, tries - 1))
+			: Promise.reject(err),
+	);
 
 const collapseWithRetry = (groupId, index) =>
 	collapseGroupWithMove(groupId, index).catch((err) => {
@@ -197,7 +234,11 @@ const createGroupsForEntries = (win, entries) =>
 		entries.map(([key, tabIds], idx) =>
 			chrome.tabs
 				.group({ tabIds, createProperties: { windowId: win } })
-				.then((groupId) => ({ groupId, title: key, key, idx })),
+				.then(async (groupId) => {
+					markAuto([groupId]);
+					await chrome.tabGroups.update(groupId, { title: getTitle(key) });
+					return { groupId, title: key, key, idx };
+				}),
 		),
 	);
 
@@ -217,10 +258,11 @@ const sortGroupsByTitle = (groupIds) => {
 	);
 };
 
-async function groupAllTabs(windowId) {
+async function groupAllTabs(windowId, { adoptByTitle = false } = {}) {
 	const opts = await getOpts();
 	const win = await getWin(windowId);
 	if (!win) return;
+	if (adoptByTitle) await getManualGroupIds({ adoptByTitle });
 	await removeDuplicateTabsInWindow(win);
 	const [tabs, manualSet] = await Promise.all([
 		chrome.tabs.query({ windowId: win }),
@@ -232,13 +274,34 @@ async function groupAllTabs(windowId) {
 	if (toUngroup.length) await chrome.tabs.ungroup(toUngroup);
 	const entries = [...buildByKey(toRegroup, opts).entries()];
 	const groupIds = await createGroupsForEntries(win, entries);
-	await addToAutoCreatedGroupIds(groupIds.map((g) => g.groupId));
 	await applyTitlesToGroups(groupIds);
 	if (opts.sortAlphabetically && groupIds.length)
 		await sortGroupsByTitle(groupIds);
 	if (opts.collapseInactive && groupIds.length) {
 		await delay(100);
 		await collapseInactiveInWindow(win);
+	}
+}
+
+const logWarn = (where) => (err) => console.warn(`[smart-tab-groups] ${where}:`, err);
+
+/** Group every normal window; one window failing does not stop the rest. */
+async function groupAllWindows({ adoptByTitle = false } = {}) {
+	const wins = await chrome.windows.getAll({ windowTypes: ['normal'] });
+	for (const w of wins)
+		await retryIfEditBlocked(() => groupAllTabs(w.id, { adoptByTitle })).catch(
+			logWarn(`group window ${w.id}`),
+		);
+}
+
+/** After session restore, wait until restored tabs report their URL (capped). */
+async function waitForTabsSettled(timeoutMs = 5000) {
+	const end = Date.now() + timeoutMs;
+	await delay(500);
+	while (Date.now() < end) {
+		const tabs = await chrome.tabs.query({});
+		if (!tabs.some((t) => !t.url && t.pendingUrl)) return;
+		await delay(250);
 	}
 }
 
@@ -307,7 +370,6 @@ async function assignTabToGroup(tabId, url, windowId) {
 	if (!added) {
 		const allKeys = [...new Set([...groupIdToKey.values(), key])].sort();
 		const idx = allKeys.indexOf(key);
-		const { groupId } = await createGroup({ windowId: winId, key, tabIds: [tabId], idx });
-		await addToAutoCreatedGroupIds([groupId]);
+		await createGroup({ windowId: winId, key, tabIds: [tabId], idx });
 	}
 }
